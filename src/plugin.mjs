@@ -7,7 +7,12 @@ import { openAIResponse, errorResponse } from "./stream.mjs";
 const failed = error => ({ type: "failed", error: error instanceof LogiccError ? error.message :
   "Logicc sign-in failed. Check the browser or sign in again." });
 
-export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait } = {}) {
+// A public client registration belongs to the plugin, not the person signing
+// in. Leave unset until Logicc explicitly provisions an authorized client.
+const REGISTERED_CLIENT_ID = undefined;
+
+export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait,
+  registeredClientId = REGISTERED_CLIENT_ID } = {}) {
   const manager = createAuthManager(client, fetchImpl);
   async function signIn(cookie, sid, signal) {
     try {
@@ -36,19 +41,20 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait 
       methods: [
         {
           type: "oauth",
-          label: "Logicc OAuth (system browser, approved client ID required)",
-          prompts: [{
-            type: "text", key: "clientId", message: "Public OAuth client ID issued by Logicc (not an API key)",
-            validate: value => validClientId(value?.trim()) ? undefined : "An approved public OAuth client ID is required.",
-          }],
-          async authorize(inputs, { signal } = {}) {
+          label: "Sign in to Logicc (browser)",
+          async authorize(_inputs, { signal } = {}) {
+            if (!validClientId(registeredClientId)) {
+              return { type: "failed", error: "Logicc has not enabled a supported OAuth authorization for this plugin. You do not need to enter a client ID or API key. Browser sign-in is not available yet." };
+            }
             let device;
-            try { device = await beginDeviceAuthorization(inputs?.clientId?.trim(), { fetchImpl, signal }); }
+            try { device = await beginDeviceAuthorization(registeredClientId, { fetchImpl, signal }); }
             catch (error) { return failed(error); }
             return {
               url: device.url,
               method: "auto",
-              instructions: "Sign in and consent in your normal browser. Enter the device code " + device.userCode + ". Magpie will finish after Logicc authorizes the client.",
+              instructions: "Sign in and consent in your normal browser. " +
+                (device.complete ? "Confirm the code " : "Enter the code ") + device.userCode +
+                " if requested. Magpie will finish after Logicc authorizes the client.",
               async callback(_code, { signal: callbackSignal } = {}) {
                 const signals = [signal, callbackSignal].filter(Boolean);
                 const combined = signals.length > 1 ? AbortSignal.any(signals) : signals[0];

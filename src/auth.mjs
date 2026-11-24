@@ -125,7 +125,7 @@ function oauthFailure(response, data) {
   switch (data?.error) {
     case "invalid_client":
     case "unauthorized_client":
-      return new LogiccError(400, "Logicc requires an approved public OAuth client ID with device authorization enabled.");
+      return new LogiccError(400, "Logicc has not authorized this plugin for browser sign-in.");
     case "invalid_scope":
       return new LogiccError(400, "Logicc has not enabled the requested OAuth permissions for this client.");
     case "access_denied":
@@ -170,14 +170,16 @@ export async function beginDeviceAuthorization(clientId, { fetchImpl = fetch, si
   const { response: res, data } = await oauthForm(DEVICE_URL,
     { client_id: clientId, scope: DEVICE_SCOPE }, fetchImpl, signal);
   if (!res.ok) throw oauthFailure(res, data);
-  const url = verificationUrl(data?.verification_uri);
+  const verification = verificationUrl(data?.verification_uri);
+  const complete = data?.verification_uri_complete != null;
+  const url = complete ? verificationUrl(data.verification_uri_complete) : verification;
   const interval = data?.interval ?? 5;
   if (!validOAuthToken(data?.device_code) || typeof data.user_code !== "string" ||
       !/^[A-Za-z0-9 -]{1,64}$/.test(data.user_code) || !Number.isFinite(data.expires_in) ||
       data.expires_in <= 0 || !Number.isFinite(interval) || interval < 1) {
     throw new LogiccError(502, "Logicc returned an invalid device authorization response.");
   }
-  return { clientId, url, userCode: data.user_code, deviceCode: data.device_code,
+  return { clientId, url, complete, userCode: data.user_code, deviceCode: data.device_code,
     deadline: Date.now() + Math.min(data.expires_in, 900) * 1000,
     interval: Math.ceil(interval) };
 }

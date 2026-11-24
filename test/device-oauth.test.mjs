@@ -59,12 +59,12 @@ function makeFetch({ start = device, discovery = metadata, poll = [tokens], mode
 test("device grant uses the documented system-browser hook and never exposes its device secret", async () => {
   const { fetchImpl, calls } = makeFetch();
   let writes = 0;
-  const plugin = createPlugin({ fetchImpl, deviceWait: skipWait,
+  const plugin = createPlugin({ fetchImpl, deviceWait: skipWait, registeredClientId: clientId,
     client: { auth: { set: async () => { writes++; } } } });
   const method = plugin.auth.methods[0];
   expect(method.type).toBe("oauth");
-  expect(method.prompts[0].key).toBe("clientId");
-  const step = await method.authorize({ clientId });
+  expect(method.prompts).toBeUndefined();
+  const step = await method.authorize();
   expect(step.url).toBe(device.verification_uri);
   expect(step.method).toBe("auto");
   expect(step.instructions).toContain(device.user_code);
@@ -96,16 +96,19 @@ test("missing/unauthorized client, changed metadata, or untrusted browser URL fa
   const plugin = createPlugin({ fetchImpl: async () => { attempted = true; throw new Error("not allowed"); } });
   const missing = await plugin.auth.methods[0].authorize({});
   expect(missing.type).toBe("failed");
-  expect(missing.error).toContain("client ID");
+  expect(missing.error).toContain("not available yet");
+  expect(missing.callback).toBeUndefined();
+  expect((await plugin.auth.methods[0].authorize({ clientId })).type).toBe("failed");
   expect(attempted).toBe(false);
   for (const config of [
     { start: { error: "invalid_client", error_description: "secret upstream diagnostic" } },
     { start: { ...device, verification_uri: "https://logicc.com.attacker.example/device" } },
+    { start: { ...device, verification_uri_complete: "https://other.example/device?code=ABCD-EFGH" } },
     { discovery: { ...metadata, token_endpoint: "https://other.example/token" } },
     { discovery: { ...metadata, grant_types_supported: [] } },
   ]) {
     const { fetchImpl, calls } = makeFetch(config);
-    const denied = await createPlugin({ fetchImpl }).auth.methods[0].authorize({ clientId });
+    const denied = await createPlugin({ fetchImpl, registeredClientId: clientId }).auth.methods[0].authorize();
     expect(denied.type).toBe("failed");
     expect(denied.error).not.toContain("secret upstream diagnostic");
     expect(denied.callback).toBeUndefined();
@@ -113,17 +116,27 @@ test("missing/unauthorized client, changed metadata, or untrusted browser URL fa
   }
 });
 
+test("provider-issued complete verification URL avoids manual code entry when supported", async () => {
+  const completeUrl = device.verification_uri + "?user_code=" + device.user_code;
+  const { fetchImpl } = makeFetch({ start: { ...device, verification_uri_complete: completeUrl } });
+  const plugin = createPlugin({ fetchImpl, registeredClientId: clientId, deviceWait: skipWait });
+  const step = await plugin.auth.methods[0].authorize();
+  expect(step.url).toBe(completeUrl);
+  expect(step.instructions).toContain("Confirm the code");
+  expect((await step.callback()).type).toBe("success");
+});
+
 test("cancelled or denied device authorization never saves an account", async () => {
   for (const error of ["access_denied", "expired_token"]) {
     const { fetchImpl, calls } = makeFetch({ poll: [{ error }] });
-    const plugin = createPlugin({ fetchImpl, deviceWait: skipWait });
-    const step = await plugin.auth.methods[0].authorize({ clientId });
+    const plugin = createPlugin({ fetchImpl, deviceWait: skipWait, registeredClientId: clientId });
+    const step = await plugin.auth.methods[0].authorize();
     const result = await step.callback();
     expect(result.type).toBe("failed");
     expect(calls.some(c => c.url.endsWith("/oauth/userinfo"))).toBe(false);
   }
   const { fetchImpl, calls } = makeFetch();
-  const step = await createPlugin({ fetchImpl, deviceWait: skipWait }).auth.methods[0].authorize({ clientId });
+  const step = await createPlugin({ fetchImpl, deviceWait: skipWait, registeredClientId: clientId }).auth.methods[0].authorize();
   const cancelled = await step.callback(undefined, { signal: AbortSignal.abort() });
   expect(cancelled.type).toBe("failed");
   expect(cancelled.error).toContain("cancelled");
@@ -134,8 +147,8 @@ test("OAuth consent is not accepted as inference permission; 401 and 403 fail be
   for (const status of [401, 403]) {
     const { fetchImpl, calls } = makeFetch({ modelStatus: status });
     let writes = 0;
-    const plugin = createPlugin({ fetchImpl, deviceWait: skipWait, client: { auth: { set: async () => { writes++; } } } });
-    const step = await plugin.auth.methods[0].authorize({ clientId });
+    const plugin = createPlugin({ fetchImpl, deviceWait: skipWait, registeredClientId: clientId, client: { auth: { set: async () => { writes++; } } } });
+    const step = await plugin.auth.methods[0].authorize();
     const result = await step.callback();
     expect(result.type).toBe("failed");
     expect(result.error).toContain("model access was refused");
