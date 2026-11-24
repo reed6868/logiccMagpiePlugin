@@ -1,14 +1,20 @@
 # logiccMagpiePlugin
 
-An unofficial, dependency-free Logicc provider plugin for [Magpie](https://usemagpie.ai/docs/plugins). Use only an account you are authorized to use and comply with the service's terms, limits and policies. This is an experimental adapter for Logicc's web API, not a vendor-supported OAuth grant or API.
+An unofficial, dependency-free Logicc provider plugin for [Magpie](https://usemagpie.ai/docs/plugins). Use only an account and client registration you are authorized to use and comply with the service's terms, limits and policies. The web API adapter remains experimental.
 
 ## Install and sign in
 
 1. `magpie plugin add github:reed6868/logiccMagpiePlugin` (or add the absolute path of a local clone).
 2. `magpie plugin login logicc`
-3. Choose **Logicc browser sign-in (private window)** and sign in yourself in the isolated Chrome/Chromium/Edge window. If the browser is not found, set `LOGICC_BROWSER` to its executable path. A graphical desktop is required. The plugin closes the window and removes its temporary profile after sign-in, cancellation or timeout. It never attaches to the user's normal browser.
-4. Alternatively, choose **Logicc manual sign-in** and provide your own authorized Logicc client credential and, if necessary, its session ID. When no session ID is provided, the plugin accepts only an unambiguous active session (or the active session explicitly identified by Clerk). Treat the credential as a password: do not share it, enter it in chat, or put it into shell commands.
+3. Choose **Logicc OAuth (system browser, approved client ID required)**. Enter the public OAuth client ID issued by Logicc with the device grant enabled. This is a client identifier, not an API key or client secret. Magpie opens the device verification page in your system browser and shows the code. Sign in and consent there. The plugin polls the token endpoint and verifies model access before saving the account.
+4. Alternatively, if you already have an explicitly authorized Logicc client credential, choose **Logicc manual sign-in**. The existing manual import is masked in Magpie. When no session ID is provided, the plugin accepts only an unambiguous active session (or the active session explicitly identified by Clerk). Treat the credential as a password: do not share it, enter it in chat, or put it into shell commands.
 5. `magpie models | grep logicc` lists discovered models. The initial `logicc/default` entry resolves to the account's upstream default model (or its first model) when discovery succeeds.
+
+### OAuth prerequisites and limits
+
+Logicc's Clerk issuer publishes Device Authorization Grant support at its public OpenID discovery endpoint. The plugin follows the [Clerk device authorization flow](https://clerk.com/docs/guides/configure/auth-strategies/oauth/device-authorization-grant) and Magpie's `authorize` / `callback` contract. It requests only `openid offline_access`. An approved public client registration with device authorization enabled is required. The discovery document does not currently advertise automatic client registration; this repository neither contains a pre-approved client ID nor registers an app on the user's behalf. Ask Logicc for an authorized client ID and confirmation that its OAuth access tokens are accepted by the model and chat endpoints. A successful identity consent alone is insufficient. The plugin refuses to save an OAuth account if its model catalogue request is rejected.
+
+Version 0.2.0 removes the automated, isolated Chrome/CDP login because federated sign-in may reject controlled browsing environments. It does not attach to, inspect, or extract sessions from a normal browser. No API key is introduced. Existing saved accounts can still use their previous refresh flow. Real vendor-approved device login and chat inference have not yet been verified.
 
 ## API and compatibility
 
@@ -20,9 +26,9 @@ An unofficial, dependency-free Logicc provider plugin for [Magpie](https://usema
 
 ## Credential and request handling
 
-Credentials are kept only in Magpie's account-scoped authentication store (`plugin-auth.json`, documented as mode 0600). They are sensitive plaintext secrets, not public configuration. The JWT expiry is read from the returned token, refresh occurs shortly before expiry, and rotated client credentials are saved through the Magpie auth contract. A 401 triggers one refresh/retry; revoked credentials mark the account expired. Rate limits return 429 and preserve Retry-After without retries or bypasses. A 403 model refusal is not treated as an expired account.
+Credentials are kept only in Magpie's account-scoped authentication store (`plugin-auth.json`, documented as mode 0600). They are sensitive plaintext secrets, not public configuration. Device OAuth uses the standard refresh-token grant and returned expiry; legacy accounts retain JWT expiry and client credential rotation. Renewed tokens are saved through the Magpie auth contract. A 401 triggers one refresh/retry; revoked credentials mark the account expired. Rate limits return 429 and preserve Retry-After without retries or bypasses. A 403 model refusal is not treated as an expired account.
 
-The plugin only sends sign-in credentials to the fixed Logicc Clerk origin and JWTs to the fixed Logicc application API. Redirects are refused. Browser sign-in uses a newly created profile with local process-pipe communication, not an open remote debugging port. Browser cookies, tokens, upstream private error bodies and user prompts are not logged or committed. For a revoked or compromised sign-in, revoke the vendor session and run `magpie plugin logout logicc`.
+The plugin sends sign-in credentials only to the fixed Logicc Clerk origin, and access tokens to the fixed Logicc application API and Clerk identity endpoint as appropriate. Redirects are refused. The browser verification URL must be HTTPS on a Logicc domain; Magpie opens it rather than the plugin spawning a browser. Tokens, upstream private error bodies and user prompts are not logged or committed. For a revoked or compromised sign-in, revoke the vendor grant or session and run `magpie plugin logout logicc`.
 
 ## Development
 

@@ -1,6 +1,6 @@
 {
   "name": "logicc-magpie-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Logicc provider for Magpie",
   "type": "module",
   "main": "./index.mjs",

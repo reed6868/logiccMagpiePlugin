@@ -1,14 +1,13 @@
-import { API, ID, REFRESH_LEAD, LogiccError, createAuthManager, refreshAuth, apiRequest, validCookie, validSession } from "./auth.mjs";
+import { API, ID, REFRESH_LEAD, LogiccError, createAuthManager, refreshAuth, apiRequest, validCookie, validSession,
+  validClientId, beginDeviceAuthorization, completeDeviceAuthorization } from "./auth.mjs";
 import { DEFAULT_MODEL, SDK, listModels, runtimeModels } from "./models.mjs";
 import { normalize, buildPrompt } from "./prompt.mjs";
 import { openAIResponse, errorResponse } from "./stream.mjs";
-import { browserPrerequisites, browserSignIn } from "./browser.mjs";
 
 const failed = error => ({ type: "failed", error: error instanceof LogiccError ? error.message :
   "Logicc sign-in failed. Check the browser or sign in again." });
 
-export function createPlugin({ client, fetchImpl = globalThis.fetch,
-  browser = { prerequisites: browserPrerequisites, signIn: browserSignIn } } = {}) {
+export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait } = {}) {
   const manager = createAuthManager(client, fetchImpl);
   async function signIn(cookie, sid, signal) {
     try {
@@ -37,23 +36,41 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch,
       methods: [
         {
           type: "oauth",
-          label: "Logicc browser sign-in (private window)",
-          async authorize(_inputs, { signal } = {}) {
-            let binary;
-            try { binary = await browser.prerequisites(); }
-            catch { return { type: "failed", error: "Chrome/Chromium/Edge or a graphical session is unavailable; use manual sign-in." }; }
+          label: "Logicc OAuth (system browser, approved client ID required)",
+          prompts: [{
+            type: "text", key: "clientId", message: "Public OAuth client ID issued by Logicc (not an API key)",
+            validate: value => validClientId(value?.trim()) ? undefined : "An approved public OAuth client ID is required.",
+          }],
+          async authorize(inputs, { signal } = {}) {
+            let device;
+            try { device = await beginDeviceAuthorization(inputs?.clientId?.trim(), { fetchImpl, signal }); }
+            catch (error) { return failed(error); }
             return {
-              url: "",
+              url: device.url,
               method: "auto",
-              instructions: "A new isolated browser window will open at app.logicc.com. Sign in to your own authorized account. The plugin stores only the Logicc sign-in and closes the private window.",
+              instructions: "Sign in and consent in your normal browser. Enter the device code " + device.userCode + ". Magpie will finish after Logicc authorizes the client.",
               async callback(_code, { signal: callbackSignal } = {}) {
                 const signals = [signal, callbackSignal].filter(Boolean);
                 const combined = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
-                let credentials;
-                try { credentials = await browser.signIn({ binary, signal: combined }); }
-                catch { return { type: "failed", error: "Private Logicc browser sign-in cancelled, timed out, or failed." }; }
-                if (!validCookie(credentials?.cookie) || !validSession(credentials?.sid)) return { type: "failed", error: "No valid Logicc sign-in was found." };
-                return signIn(credentials.cookie, credentials.sid, combined);
+                try {
+                  const auth = await completeDeviceAuthorization(device, { fetchImpl, signal: combined, wait: deviceWait });
+                  const getAuth = async () => ({ ...auth, type: "oauth" });
+                  // A Clerk OAuth grant is not proof that Logicc's inference
+                  // endpoint accepts the token. Verify before saving any account.
+                  const verifyManager = { async ensure(_getAuth, { force = false } = {}) {
+                    if (force) throw new LogiccError(401, "Logicc does not accept this OAuth token for model access.");
+                    return getAuth();
+                  } };
+                  try { await listModels(verifyManager, getAuth, fetchImpl, combined); }
+                  catch (error) {
+                    if (error.status === 401 || error.status === 403) {
+                      throw new LogiccError(error.status, "Logicc OAuth consent succeeded, but model access was refused. The client must be authorized for inference.");
+                    }
+                    throw error;
+                  }
+                  if (combined?.aborted) throw new LogiccError(400, "Logicc OAuth sign-in cancelled.");
+                  return { type: "success", ...auth };
+                } catch (error) { return failed(error); }
               },
             };
           },
@@ -62,10 +79,10 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch,
           type: "oauth",
           label: "Logicc manual sign-in (client credential + optional session ID)",
           prompts: [
-            { type: "text", key: "cookie", message: "Logicc __client cookie value (sensitive; use only your own account)",
-              validate: v => validCookie(v.trim()) ? undefined : "Enter only the cookie value." },
+            { type: "password", key: "cookie", message: "Existing authorized Logicc client credential (sensitive)",
+              validate: v => validCookie(v?.trim()) ? undefined : "Enter a valid client credential." },
             { type: "text", key: "sid", message: "Session ID (sess_..., or leave empty for discovery)",
-              validate: v => !v.trim() || validSession(v.trim()) ? undefined : "Invalid sess_ ID." },
+              validate: v => !v?.trim() || validSession(v.trim()) ? undefined : "Invalid sess_ ID." },
           ],
           async authorize(inputs = {}, { signal } = {}) {
             const cookie = inputs.cookie?.trim();
