@@ -3,7 +3,10 @@
 import { LogiccError } from "./auth.mjs";
 import { parseToolOutput } from "./prompt.mjs";
 
-const MAX_OUTPUT = 1024 * 1024;
+const MAX_FRAME = 1024 * 1024;
+const MAX_OUTPUT = 8 * 1024 * 1024;
+const MAX_TOOL_BLOCK = 2 * 1024 * 1024;
+const MAX_PREFIX = 256;
 const DONE = Symbol("done");
 
 export async function* parseAiSdkStream(body) {
@@ -24,13 +27,13 @@ export async function* parseAiSdkStream(body) {
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
       let separator;
       while ((separator = /\r?\n\r?\n/.exec(buffer))) {
-        if (separator.index > MAX_OUTPUT) throw new LogiccError(502, "Logicc SSE frame is too large.");
+        if (separator.index > MAX_FRAME) throw new LogiccError(502, "Logicc SSE frame is too large.");
         const event = parse(buffer.slice(0, separator.index));
         buffer = buffer.slice(separator.index + separator[0].length);
         if (event === DONE) return;
         if (event) yield event;
       }
-      if (buffer.length > MAX_OUTPUT) throw new LogiccError(502, "Logicc SSE frame is too large.");
+      if (buffer.length > MAX_FRAME) throw new LogiccError(502, "Logicc SSE frame is too large.");
       if (done) break;
     }
     if (buffer.trim()) { const event = parse(buffer); if (event && event !== DONE) yield event; }
@@ -50,10 +53,59 @@ export function usageOf(event) {
   return { prompt_tokens: input, completion_tokens: output, total_tokens: input + output };
 }
 
+// Only an initial tool envelope can delay text. A normal answer, including
+// ordinary JSON/code fences, is released as soon as its prefix diverges.
+// Legacy content-first envelopes are recognized within the same bounded probe.
+export function classifyToolPrefix(text) {
+  let rest = text.trimStart();
+  const match = token => {
+    if (rest.startsWith(token)) { rest = rest.slice(token.length).trimStart(); return "match"; }
+    return token.startsWith(rest) ? "prefix" : "plain";
+  };
+  if (!rest) return "prefix";
+  if (rest.startsWith("\x60")) {
+    const fence = match("\x60\x60\x60");
+    if (fence !== "match") return fence;
+    if (/^[jJ]/.test(rest)) {
+      const json = rest.toLowerCase();
+      if ("json".startsWith(json) && json.length < 4) return "prefix";
+      if (!/^json(?:\s|\{)/i.test(rest) && json !== "json") return "plain";
+      rest = rest.slice(4).trimStart();
+    }
+  }
+  const object = match("{");
+  if (object !== "match") return object;
+  const key = match('"tool_calls"');
+  if (key === "match") {
+    const colon = match(":");
+    return colon === "match" ? "tool" : colon;
+  }
+  if (key === "prefix") return key;
+  const legacy = match('"content"');
+  if (legacy !== "match") return legacy;
+  const colon = match(":");
+  if (colon !== "match") return colon;
+  if (rest.startsWith('"')) {
+    const string = /^"(?:[^"\\\x00-\x1f]|\\[^\x00-\x1f])*"/.exec(rest);
+    if (!string) return "prefix";
+    rest = rest.slice(string[0].length).trimStart();
+  } else {
+    const nil = match("null");
+    if (nil !== "match") return nil;
+  }
+  const comma = match(",");
+  if (comma !== "match") return comma;
+  const calls = match('"tool_calls"');
+  if (calls !== "match") return calls;
+  const delimiter = match(":");
+  return delimiter === "match" ? "tool" : delimiter;
+}
+
 async function* parts(body, req) {
   let text = "", bytes = 0, finished = false, reason = "stop", usage;
   const native = new Map();
   const toolMode = req.active.length > 0;
+  let mode = toolMode ? "prefix" : "plain";
   const account = delta => {
     bytes += Buffer.byteLength(delta);
     if (bytes > MAX_OUTPUT) throw new LogiccError(502, "Logicc output is too large.");
@@ -63,8 +115,21 @@ async function* parts(body, req) {
     if (event.type === "error" || event.type === "abort") throw new LogiccError(502, "Logicc stream reported an error.");
     if (event.type === "text-delta" && typeof event.delta === "string" && event.delta) {
       account(event.delta);
-      if (toolMode) text += event.delta;
-      else yield { content: event.delta };
+      if (mode === "plain") yield { content: event.delta };
+      else if (mode === "prefix") {
+        // Limit the probe even when an upstream event contains a long delta.
+        const combined = text + event.delta;
+        const next = classifyToolPrefix(combined.slice(0, MAX_PREFIX));
+        if (next === "tool") {
+          mode = "tool";
+          text = combined;
+        } else if (next === "plain" || combined.length >= MAX_PREFIX) {
+          mode = "plain";
+          text = "";
+          yield { content: combined };
+        } else text = combined;
+      } else text += event.delta;
+      if (mode === "tool" && text.length > MAX_TOOL_BLOCK) throw new LogiccError(502, "Logicc tool envelope is too large.");
     } else if (event.type === "reasoning-delta" && typeof event.delta === "string" && event.delta) {
       account(event.delta);
       yield { reasoning_content: event.delta };
@@ -102,7 +167,18 @@ async function* parts(body, req) {
   if (!finished) throw new LogiccError(502, "Logicc stream ended before its finish event.");
   if (toolMode) {
     const pending = [...native.values()].filter(c => !c.executed);
-    const result = parseToolOutput(text, req, pending);
+    // Native calls stay pending until finish because the provider may execute
+    // them itself. Never return a raw envelope alongside native tool calls.
+    let result;
+    if (mode === "tool") {
+      const envelope = parseToolOutput(text, pending.length ? { ...req, required: false } : req, [], { requireEnvelope: true });
+      result = pending.length ? { text: envelope.text, calls: parseToolOutput("", req, pending).calls } : envelope;
+    } else if (pending.length) {
+      result = parseToolOutput(text, req, pending);
+    } else {
+      if (req.required) throw new LogiccError(502, "Model did not return a valid required tool call.");
+      result = { text, calls: [] };
+    }
     const executedNames = new Set([...native.values()].filter(c => c.executed).map(c => c.name));
     if (!pending.length && result.calls.some(c => executedNames.has(c.function.name))) {
       throw new LogiccError(502, "Refusing to repeat a provider-executed tool call.");

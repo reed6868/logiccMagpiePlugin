@@ -1,34 +1,31 @@
 # logiccMagpiePlugin
 
-An unofficial, dependency-free Logicc provider plugin for [Magpie](https://usemagpie.ai/docs/plugins). Use only an account and client registration you are authorized to use and comply with the service's terms, limits and policies. The web API adapter remains experimental.
+An unofficial, dependency-free Logicc provider plugin for [Magpie](https://usemagpie.ai/docs/plugins). Use only credentials and accounts you are authorized to use and comply with the service's terms, limits and policies. The web API adapter remains experimental; live end-to-end verification is required before merging the refactor.
 
 ## Install and sign in
 
 1. `magpie plugin add github:reed6868/logiccMagpiePlugin` (or add the absolute path of a local clone).
 2. `magpie plugin login logicc`
-3. Choose **Logicc OAuth (system browser, approved client ID required)**. Enter the public OAuth client ID issued by Logicc with the device grant enabled. This is a client identifier, not an API key or client secret. Magpie opens the device verification page in your system browser and shows the code. Sign in and consent there. The plugin polls the token endpoint and verifies model access before saving the account.
-4. Alternatively, if you already have an explicitly authorized Logicc client credential, choose **Logicc manual sign-in**. The existing manual import is masked in Magpie. When no session ID is provided, the plugin accepts only an unambiguous active session (or the active session explicitly identified by Clerk). Treat the credential as a password: do not share it, enter it in chat, or put it into shell commands.
-5. `magpie models | grep logicc` lists discovered models. The initial `logicc/default` entry resolves to the account's upstream default model (or its first model) when discovery succeeds.
+3. Choose **Logicc authorized credential import (optional session ID)** if you already have a client credential explicitly authorized for this use. The masked prompt accepts the existing credential value or an explicitly supplied Cookie header containing one unambiguous `__client` value. Other cookies are discarded; conflicting values and multiline headers are rejected. The session ID is optional: use the active session designated by Clerk, otherwise prefer the most recent active session (last-active timestamp, then update timestamp; deterministic ID order breaks ties). An explicit session ID overrides selection. Treat credentials as passwords; never share them, enter them in chat, or pass them on a command line.
+4. `magpie models | grep logicc` lists discovered models. `logicc/default` pins the account's selected upstream model during successful sign-in. If the upstream does not identify a default, the initial selection is deterministic by model ID.
 
-### OAuth prerequisites and limits
+### Authentication status
 
-Logicc's Clerk issuer publishes Device Authorization Grant support at its public OpenID discovery endpoint. The plugin follows the [Clerk device authorization flow](https://clerk.com/docs/guides/configure/auth-strategies/oauth/device-authorization-grant) and Magpie's `authorize` / `callback` contract. It requests only `openid offline_access`. An approved public client registration with device authorization enabled is required. The discovery document does not currently advertise automatic client registration; this repository neither contains a pre-approved client ID nor registers an app on the user's behalf. Ask Logicc for an authorized client ID and confirmation that its OAuth access tokens are accepted by the model and chat endpoints. A successful identity consent alone is insufficient. The plugin refuses to save an OAuth account if its model catalogue request is rejected.
-
-Version 0.2.0 removes the automated, isolated Chrome/CDP login because federated sign-in may reject controlled browsing environments. It does not attach to, inspect, or extract sessions from a normal browser. No API key is introduced. Existing saved accounts can still use their previous refresh flow. Real vendor-approved device login and chat inference have not yet been verified.
+The incompatible Device Grant login method has been removed. An authorized Clerk frontend-session credential is exchanged for a session JWT and model access is checked before the account is saved. Old device-grant accounts must sign in again. The plugin does not inspect browser profiles or extract browser sessions, and automatic browser sign-in is not implemented: no supported Logicc-to-plugin authorization handoff has been verified. It does not claim that opening the Logicc login page alone authorizes Magpie. No Logicc API key or end-user OAuth client ID is required by the remaining import method.
 
 ## API and compatibility
 
 - The gateway uses OpenAI Chat Completions (`@ai-sdk/openai-compatible`). Both streaming and non-streaming requests are supported. No separate adapter server is required.
-- Logicc chat creation and generation use the account's actual model IDs. A temporary catalogue failure preserves Magpie's previous model list; unknown context/output limits use conservative 32,768/4,096 defaults, not vendor claims.
+- Logicc chat creation and generation use the account's actual model IDs. Temporary catalogue failures retain the last successful per-session snapshot in the running host. Default model selection is persisted at sign-in and does not change with list order or upstream default flags; if it disappears, select an explicit model. Limits use actual upstream fields, exact host metadata, then conservative model-family estimates (e.g. Claude 200k context, Opus/Sonnet 32k output). These estimates are not vendor-guaranteed limits. Only unrecognized models fall back to 32,768/4,096.
 - AI SDK v6 SSE text and reasoning deltas are forwarded as OpenAI `content` and `reasoning_content`. Reported token usage is forwarded when available; unknown usage is not fabricated.
-- Logicc's web chat API does not natively register arbitrary client functions. Client tools use the structured-prompt bridge adapted from logicc2api, and recognized upstream native tool events are also supported. Tool-mode text is buffered until completion so the JSON envelope and arguments can be validated before emitting indexed `tool_calls`. A provider-executed tool is not handed back to the client to repeat. The adapter does not execute client tools. This is not native constrained decoding or a complete JSON Schema validator.
-- Text messages and function tools only. Images, file/audio inputs and unsupported tool kinds are rejected. Token limits are prompt instructions, not hard upstream sampling controls. Availability, output quality and quotas depend on Logicc and the signed-in account.
+- Logicc's web chat API does not natively register arbitrary client functions. Client tools use a structured-prompt bridge: normal answers are plain text; tool calls start with a JSON `tool_calls` envelope. A 256-character prefix probe releases ordinary text immediately once it diverges, while actual tool blocks are buffered for validation and indexed `tool_calls` emission. Reasoning is forwarded independently, including while a prefix or tool block is pending. Native tool events are supported; provider-executed tools are not returned for repetition. The adapter does not execute client tools. This is not native constrained decoding or a complete JSON Schema validator.
+- Unsupported non-function tool definitions are ignored; image/file/audio/video content parts are replaced with explicit text placeholders, not forwarded. Unsupported token limits (`max_tokens`, `max_completion_tokens`) are ignored without altering the user's prompt. The request budget is 32 MiB before normalization, 16 MiB for forwarded text, 8 MiB for generated output, and a 15-minute total generation ceiling. Availability, output quality and quotas depend on Logicc and the signed-in account.
 
 ## Credential and request handling
 
-Credentials are kept only in Magpie's account-scoped authentication store (`plugin-auth.json`, documented as mode 0600). They are sensitive plaintext secrets, not public configuration. Device OAuth uses the standard refresh-token grant and returned expiry; legacy accounts retain JWT expiry and client credential rotation. Renewed tokens are saved through the Magpie auth contract. A 401 triggers one refresh/retry; revoked credentials mark the account expired. Rate limits return 429 and preserve Retry-After without retries or bypasses. A 403 model refusal is not treated as an expired account.
+Credentials are kept only in Magpie's account-scoped authentication store (`plugin-auth.json`, documented as mode 0600). They are sensitive plaintext secrets, not public configuration. Session JWT expiry and rotated client credentials are saved through the Magpie auth contract. A 401 triggers one refresh/retry; revoked credentials mark the account expired. Rate limits return 429 and preserve Retry-After without retries or bypasses. A 403 model refusal is not treated as an expired account.
 
-The plugin sends sign-in credentials only to the fixed Logicc Clerk origin, and access tokens to the fixed Logicc application API and Clerk identity endpoint as appropriate. Redirects are refused. The browser verification URL must be HTTPS on a Logicc domain; Magpie opens it rather than the plugin spawning a browser. Tokens, upstream private error bodies and user prompts are not logged or committed. For a revoked or compromised sign-in, revoke the vendor grant or session and run `magpie plugin logout logicc`.
+The plugin sends sign-in credentials only to the fixed Logicc Clerk origin, and session JWTs only to the fixed Logicc application API. Redirects are refused. Tokens, upstream private error bodies and user prompts are not logged or committed. For a revoked or compromised sign-in, revoke the vendor session and run `magpie plugin logout logicc`.
 
 ## Development
 
@@ -39,22 +36,38 @@ bun test
 
 The tests use synthetic credentials, mock responses and fragmented SSE, and never contact a real account. GitHub Actions runs the checks on pull requests and main.
 
-For an isolated Magpie installation, use the official sandbox procedure:
+For isolated WSL2 testing (use a checkout of the PR branch, not the live plugin directory):
 
 ```sh
 sb=$(mktemp -d)
-m() { env HOME="$sb" XDG_CONFIG_HOME="$sb/.config" XDG_CACHE_HOME="$sb/.cache" MAGPIE_ADDR=127.0.0.1:3499 magpie "$@"; }
-m plugin add "$PWD"
-m plugin
+m() {
+  env HOME="$sb" XDG_CONFIG_HOME="$sb/.config" XDG_CACHE_HOME="$sb/.cache" \
+    MAGPIE_NO_ACCOUNTS=1 MAGPIE_ADDR=127.0.0.1:3499 magpie "$@"
+}
+m plugin add "$PWD" </dev/null
+m plugin list
+m plugin login logicc
+m models | grep '^logicc/'
 ```
 
-After real sign-in on a running local gateway, use the discovered model name to run two smoke requests (one text, one required function tool). The script reports HTTP status, time to first useful delta/text, output, finish reason, tool arguments and completion time without printing account credentials.
+After real sign-in succeeds, start the isolated gateway and run three live smoke requests (ordinary text, ordinary text with tools enabled, required function tool). The script records first content/reasoning/delta timing, finish timing, content chunk count, tool arguments and HTTP status. A tool-enabled response with no early content or only one content chunk is not counted as a streaming pass. Reasoning may be absent for non-reasoning models. The script does not execute the requested tool.
 
 ```sh
-bun scripts/e2e.mjs logicc/<discovered-model-id>
+env HOME="$sb" XDG_CONFIG_HOME="$sb/.config" XDG_CACHE_HOME="$sb/.cache" \
+  MAGPIE_NO_ACCOUNTS=1 MAGPIE_ADDR=127.0.0.1:3499 magpie serve &
+gateway_pid=$!
+for i in $(seq 1 30); do
+  m healthcheck --addr 127.0.0.1:3499 >/dev/null 2>&1 && break
+  sleep 1
+done
+m healthcheck --addr 127.0.0.1:3499
+MAGPIE_URL=http://127.0.0.1:3499 bun scripts/e2e.mjs logicc/default
+# Repeat after the session JWT expires to exercise renewal, then clean up:
+m plugin logout logicc
+kill "$gateway_pid"
 ```
 
-The default gateway is `http://127.0.0.1:3425`; override it with `MAGPIE_URL` for a sandbox. If your local gateway requires a custom access key, use `MAGPIE_API_KEY` via your local secret environment.
+The default gateway is `http://127.0.0.1:3425`; override it with `MAGPIE_URL` for a sandbox. If your local gateway requires a custom access key, use `MAGPIE_API_KEY` via your local secret environment. This is a local gateway key, not a Logicc API key. Do not use the pre-login default model listing as proof of authentication. Real account login, model access, reasoning/streaming, tool calls and refresh are pending local verification; keep the PR open until these pass.
 
 ## Acknowledgements
 

@@ -40,10 +40,10 @@ test("text and reasoning stream, stable ID, finish and usage", async () => {
   expect(text.endsWith("data: [DONE]\n\n")).toBe(true);
 });
 
-test("ordinary text becomes available before upstream finish", async () => {
+test("ordinary text with tools becomes available before upstream finish", async () => {
   let source;
   const upstream = new ReadableStream({ start(c) { source = c; } });
-  const response = await openAIResponse(upstream, normalize(body()));
+  const response = await openAIResponse(upstream, normalize(body({ tools: [tool] })));
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   expect(decoder.decode((await reader.read()).value)).toContain('"role":"assistant"');
@@ -52,6 +52,68 @@ test("ordinary text becomes available before upstream finish", async () => {
   source.enqueue(encoder.encode(frame(finish)));
   source.close();
   while (!(await reader.read()).done) {}
+});
+
+test("ambiguous prefix is released immediately when it diverges, not on finish", async () => {
+  let source;
+  const upstream = new ReadableStream({ start(c) { source = c; } });
+  const response = await openAIResponse(upstream, normalize(body({ tools: [tool] })));
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  await reader.read();
+  source.enqueue(encoder.encode(frame({ type: "text-delta", delta: '{"co' })));
+  source.enqueue(encoder.encode(frame({ type: "reasoning-delta", delta: "reasoning while prefix is pending" })));
+  const reasoning = await reader.read();
+  expect(decoder.decode(reasoning.value)).toContain('"reasoning_content":"reasoning while prefix is pending"');
+  source.enqueue(encoder.encode(frame({ type: "text-delta", delta: 'de":"example"}' })));
+  expect(deltas(chunks(decoder.decode((await reader.read()).value)))[0].content).toBe('{"code":"example"}');
+  source.enqueue(encoder.encode(frame({ type: "text-delta", delta: "\nnext" })));
+  expect(deltas(chunks(decoder.decode((await reader.read()).value)))[0].content).toBe("\nnext");
+  source.enqueue(encoder.encode(frame(finish)));
+  source.close();
+  while (!(await reader.read()).done) {}
+});
+
+test("tool-first JSON arrives fragmented, reasoning is live and only the tool block is held", async () => {
+  let source;
+  const upstream = new ReadableStream({ start(c) { source = c; } });
+  const request = normalize(body({ tools: [tool] }));
+  const response = await openAIResponse(upstream, request);
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  await reader.read();
+  const fragment = frame({ type: "text-delta", delta: '{"tool_' });
+  for (let i = 0; i < fragment.length; i += 3) source.enqueue(encoder.encode(fragment.slice(i, i + 3)));
+  source.enqueue(encoder.encode(frame({ type: "text-delta", delta: 'calls":[{"name":"echo_value","arguments":' })));
+  source.enqueue(encoder.encode(frame({ type: "reasoning-delta", delta: "live reasoning" })));
+  expect(deltas(chunks(decoder.decode((await reader.read()).value)))[0].reasoning_content).toBe("live reasoning");
+  source.enqueue(encoder.encode(frame({ type: "text-delta", delta: '{"value":"ping"}}]}' })));
+  source.enqueue(encoder.encode(frame(finish)));
+  source.close();
+  let rest = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    rest += decoder.decode(value, { stream: true });
+  }
+  const rows = chunks(rest), ds = deltas(rows);
+  expect(ds.some(d => d.content)).toBe(false);
+  const calls = ds.flatMap(d => d.tool_calls ?? []);
+  expect(calls[0].function.name).toBe("echo_value");
+  expect(JSON.parse(calls[1].function.arguments)).toEqual({ value: "ping" });
+  expect(rows.at(-1).choices[0].finish_reason).toBe("tool_calls");
+});
+
+test("ordinary code fences, JSON and overlong undecided prefixes are preserved", async () => {
+  for (const ordinary of [
+    "\x60\x60\x60js\nconst value = 42;\n\x60\x60\x60",
+    '{"content":"this is ordinary JSON","extra":42}',
+    " ".repeat(257) + "ordinary text",
+  ]) {
+    const response = await openAIResponse(events(...Array.from(ordinary, delta => ({ type: "text-delta", delta })), finish),
+      normalize(body({ tools: [tool] })));
+    const ds = deltas(chunks(await response.text()));
+    expect(ds.map(d => d.content ?? "").join("")).toBe(ordinary);
+    expect(ds.some(d => d.tool_calls)).toBe(false);
+  }
 });
 
 test("native tool events become OpenAI indexed tool_calls after validation", async () => {
@@ -119,4 +181,28 @@ test("mixed roles and tool results remain in prompt history", () => {
   expect(prompt).toContain("[system]");
   expect(prompt).toContain("[Tool result: call_1]");
   expect(prompt).toContain('"value":"ping"');
+});
+
+test("unsupported tool types and media parts degrade without leaking payloads or modifying system instructions", () => {
+  const input = body({
+    messages: [{ role: "system", content: "Original system instruction" }, { role: "user", content: [
+      { type: "text", text: "Inspect the history" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,PRIVATE-IMAGE" } },
+      { type: "file", file: { file_data: "PRIVATE-FILE" } },
+    ] }],
+    tools: [{ type: "web_search", description: "unsupported" }, tool],
+    max_tokens: 17, max_completion_tokens: 23, response_format: { type: "text" },
+  });
+  const request = normalize(input);
+  expect(request.active.map(t => t.name)).toEqual(["echo_value"]);
+  expect(request.messages[0].content).toBe("Original system instruction");
+  expect(request.messages[1].content).toContain("[unsupported image omitted]");
+  expect(request.messages[1].content).toContain("[unsupported file omitted]");
+  const prompt = buildPrompt(request);
+  expect(prompt).not.toContain("PRIVATE-IMAGE");
+  expect(prompt).not.toContain("PRIVATE-FILE");
+  expect(prompt).not.toContain("output tokens");
+  expect(prompt).not.toContain("web_search");
+  expect(buildPrompt(normalize({ ...input, max_tokens: 1000, max_completion_tokens: 2000 }))).toBe(prompt);
+  expect(normalize(body({ tools: [{ type: "web_search" }], tool_choice: "required" })).active).toEqual([]);
 });

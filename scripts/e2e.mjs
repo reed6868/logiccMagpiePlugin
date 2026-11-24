@@ -12,8 +12,8 @@ async function run(label, body) {
   const response = await fetch(endpoint, { method: "POST", redirect: "error",
     headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: JSON.stringify({ model, stream: true, ...body }),
-    signal: AbortSignal.timeout(180_000) });
-  let pending = "", text = "", reasoning = "", calls = {}, finish, firstText, firstDelta, streamError = false, done = false;
+    signal: AbortSignal.timeout(900_000) });
+  let pending = "", text = "", reasoning = "", calls = {}, finish, firstText, firstDelta, firstReasoning, finishAt, contentChunks = 0, streamError = false, done = false;
   if (!response.ok) {
     await response.body?.cancel();
     console.log(JSON.stringify({ label, status: response.status, error: "Gateway rejected request", durationMs: Math.round(performance.now() - start) }));
@@ -34,19 +34,20 @@ async function run(label, body) {
       for (const choice of chunk.choices ?? []) {
         const delta = choice.delta ?? {};
         if (delta.content || delta.reasoning_content || delta.tool_calls?.length) firstDelta ??= Math.round(performance.now() - start);
-        if (delta.content) { firstText ??= Math.round(performance.now() - start); text += delta.content; }
-        if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (delta.content) { firstText ??= Math.round(performance.now() - start); contentChunks++; text += delta.content; }
+        if (delta.reasoning_content) { firstReasoning ??= Math.round(performance.now() - start); reasoning += delta.reasoning_content; }
         for (const call of delta.tool_calls ?? []) {
           const out = calls[call.index ?? 0] ??= { id: "", name: "", arguments: "" };
           if (call.id) out.id = call.id;
           if (call.function?.name) out.name += call.function.name;
           if (call.function?.arguments) out.arguments += call.function.arguments;
         }
-        if (choice.finish_reason) finish = choice.finish_reason;
+        if (choice.finish_reason) { finish = choice.finish_reason; finishAt = Math.round(performance.now() - start); }
       }
     }
   }
   const result = { label, status: response.status, firstDeltaMs: firstDelta ?? null, firstTextMs: firstText ?? null,
+    firstReasoningMs: firstReasoning ?? null, finishMs: finishAt ?? null, contentChunks,
     durationMs: Math.round(performance.now() - start), text, reasoning, toolCalls: Object.values(calls), finish, done, streamError };
   console.log(JSON.stringify(result, null, 2));
   if (label === "tools") {
@@ -56,11 +57,21 @@ async function run(label, body) {
         JSON.parse(call.arguments).value === "logicc-e2e";
     } catch { return false; }
   }
-  return !streamError && done && Boolean(text) && finish === "stop";
+  if (label === "tools-auto-text") {
+    // Require real text before the final chunk. A short/single-chunk upstream
+    // reply is inconclusive and must not be reported as a streaming pass.
+    return !streamError && done && !Object.keys(calls).length && finish === "stop" &&
+      contentChunks >= 2 && firstText != null && finishAt != null && firstText < finishAt;
+  }
+  return !streamError && done && text.trim() === "Logicc E2E OK" && finish === "stop";
 }
+const echo = { type: "function", function: { name: "echo_value", description: "Echo the supplied value",
+  parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false } } };
 const normal = await run("stream", { messages: [{ role: "user", content: "Reply with exactly: Logicc E2E OK" }] });
+const autoText = await run("tools-auto-text", { messages: [{ role: "user",
+  content: "Without calling any tools, write 12 numbered lines explaining simple JavaScript array operations. Include an example in each line." }],
+  tools: [echo], tool_choice: "auto" });
 const tools = await run("tools", { messages: [{ role: "user", content: 'Call echo_value with value "logicc-e2e". Do not answer in text.' }],
-  tools: [{ type: "function", function: { name: "echo_value", description: "Echo the supplied value",
-    parameters: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false } } }],
+  tools: [echo],
   tool_choice: { type: "function", function: { name: "echo_value" } }, parallel_tool_calls: false });
-process.exitCode = normal && tools ? 0 : 1;
+process.exitCode = normal && autoText && tools ? 0 : 1;

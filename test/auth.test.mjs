@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { refreshAuth, createAuthManager, apiRequest, isFresh } from "../src/auth.mjs";
+import { refreshAuth, createAuthManager, apiRequest, isFresh, parseClientCredential, chooseActiveSession } from "../src/auth.mjs";
 
 const sid = "sess_fixture_one";
 const jwt = (session = sid, exp = Math.floor(Date.now() / 1000) + 120, sub = "user_fixture") =>
@@ -42,10 +42,53 @@ test("optional session discovery selects the active session and carries rotation
   expect(result.refresh).toBe("fixture-discovered");
 });
 
-test("ambiguous sessions are not guessed", async () => {
-  await expect(refreshAuth({ refresh: "fixture-cookie" }, {
-    fetchImpl: async () => json({ response: { sessions: [{ id: sid, status: "active" }, { id: "sess_other", status: "active" }] } }),
-  })).rejects.toMatchObject({ signIn: "expired" });
+test("explicit credential import accepts a single value or a Cookie header without other credentials", () => {
+  expect(parseClientCredential("fixture-cookie")).toBe("fixture-cookie");
+  expect(parseClientCredential("__client=fixture-cookie")).toBe("fixture-cookie");
+  expect(parseClientCredential("Cookie: other=private; __client=fixture-cookie; theme=dark")).toBe("fixture-cookie");
+  expect(parseClientCredential("Cookie: __client=one; __client=two")).toBeUndefined();
+  expect(parseClientCredential("Cookie: theme=dark")).toBeUndefined();
+  expect(parseClientCredential("Cookie: __client=one\r\nX-Test: two")).toBeUndefined();
+});
+
+test("multiple active sessions prefer last active ID, then recency; manual SID overrides discovery", async () => {
+  const sessions = [
+    { id: sid, status: "active", last_active_at: 1700000000000 },
+    { id: "sess_other", status: "active", last_active_at: 1700000100 },
+    { id: "sess_ended", status: "ended", updated_at: 1800000000000 },
+  ];
+  expect(chooseActiveSession({ sessions, last_active_session_id: sid })).toBe(sid);
+  expect(chooseActiveSession({ sessions, last_active_session_id: "sess_ended" })).toBe("sess_other");
+  expect(chooseActiveSession({ sessions: [
+    { id: sid, status: "active", updated_at: "2025-01-01T00:00:00Z" },
+    { id: "sess_other", status: "active", updated_at: "2025-02-01T00:00:00Z" },
+  ] })).toBe("sess_other");
+  expect(chooseActiveSession({ sessions: [{ id: "sess_b", status: "active" }, { id: "sess_a", status: "active" }] })).toBe("sess_a");
+  const credential = parseClientCredential("Cookie: theme=dark; __client=fixture-cookie");
+  for (const manual of [undefined, sid]) {
+    let discovered = 0;
+    const expected = manual ?? "sess_other";
+    const result = await refreshAuth({ refresh: credential, metadata: manual ? { sessionId: manual } : {} }, {
+      fetchImpl: async (url, init) => {
+        expect(init.headers.Cookie).toBe("__client=fixture-cookie");
+        if (url.endsWith("/v1/client")) { discovered++; return json({ response: { sessions } }); }
+        expect(url).toEndWith("/" + expected + "/tokens");
+        return json({ jwt: jwt(expected) });
+      },
+    });
+    expect(result.metadata.sessionId).toBe(expected);
+    expect(discovered).toBe(manual ? 0 : 1);
+  }
+  await expect(refreshAuth({ refresh: credential }, { fetchImpl: async () => json({ response: { sessions: [] } }) }))
+    .rejects.toMatchObject({ signIn: "expired" });
+});
+
+test("removed device OAuth accounts must sign in again; their tokens never reach inference", async () => {
+  const obsolete = { ...auth(), metadata: { oauthGrant: "device", sessionId: sid } };
+  const manager = createAuthManager(undefined, async () => { throw new Error("must not fetch"); });
+  expect(isFresh(obsolete)).toBe(false);
+  await expect(manager.renew(obsolete)).rejects.toMatchObject({ signIn: "expired" });
+  await expect(manager.ensure(async () => obsolete)).rejects.toMatchObject({ signIn: "expired" });
 });
 
 test("invalid sid, invalid cookie, mismatched JWT and revoked login fail closed", async () => {
