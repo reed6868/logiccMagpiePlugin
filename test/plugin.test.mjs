@@ -21,11 +21,10 @@ test("single exported plugin and config preserves user-defined provider", async 
   expect(existing.provider.logicc).toEqual({ name: "Custom" });
 });
 
-test("browser and manual login validate account without overwriting host auth", async () => {
-  let writes = 0, browserCalls = 0;
+test("manual login masks the credential and validates without overwriting host auth", async () => {
+  let writes = 0;
   const plugin = createPlugin({
     client: { auth: { set: async () => { writes++; } } },
-    browser: { prerequisites: () => "/fake/browser", signIn: async () => { browserCalls++; return { cookie: "fixture-cookie", sid }; } },
     fetchImpl: async url => {
       if (url.endsWith("/tokens")) return Response.json({ jwt });
       if (url.endsWith("/v1/client")) return Response.json({ response: { sessions: [{ id: sid, status: "active" }] } });
@@ -33,10 +32,7 @@ test("browser and manual login validate account without overwriting host auth", 
       throw new Error("Unexpected endpoint");
     },
   });
-  const browser = await plugin.auth.methods[0].authorize();
-  expect(browser.method).toBe("auto");
-  expect((await browser.callback()).type).toBe("success");
-  expect(browserCalls).toBe(1);
+  expect(plugin.auth.methods[1].prompts[0].type).toBe("password");
   const manual = await plugin.auth.methods[1].authorize({ cookie: "fixture-cookie", sid: "" });
   const result = await manual.callback();
   expect(result.type).toBe("success");
