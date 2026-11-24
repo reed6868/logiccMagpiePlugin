@@ -36,7 +36,7 @@ bun test
 
 The tests use synthetic credentials, mock responses and fragmented SSE, and never contact a real account. GitHub Actions runs the checks on pull requests and main.
 
-For isolated WSL2 testing (use a checkout of the PR branch, not the live plugin directory):
+For isolated native Ubuntu Linux testing (use a checkout of the PR branch, not the live plugin directory):
 
 ```sh
 sb=$(mktemp -d)

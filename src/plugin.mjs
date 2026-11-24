@@ -34,9 +34,11 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch } = {}) {
   const catalog = createModelCatalog(manager, fetchImpl);
   async function signIn(cookie, sid, signal) {
     try {
+      if (signal?.aborted) throw new LogiccError(400, "Logicc sign-in cancelled.");
       let auth = await refreshAuth({ refresh: cookie, metadata: { ...(sid ? { sessionId: sid } : {}) } },
         { fetchImpl, signal });
-      // Verify inference access before handing the account to the host.
+      // Verify catalogue access before handing the account to the host.
+      // Actual inference is covered separately by the live E2E.
       const getAuth = async () => ({ ...auth, type: "oauth" });
       const loginManager = {
         async ensure(_getAuth, { force = false } = {}) {

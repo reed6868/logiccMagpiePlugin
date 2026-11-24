@@ -106,6 +106,7 @@ export function httpError(response, label, { signIn = false } = {}) {
 
 export async function request(fetchImpl, url, init, label) {
   try {
+    if (init.signal?.aborted) throw init.signal.reason;
     return await fetchImpl(url, { ...init, redirect: "error" });
   } catch {
     if (init.signal?.aborted) throw new LogiccError(504, label + " cancelled or timed out.");
@@ -134,6 +135,10 @@ export async function refreshAuth(auth, { fetchImpl = fetch, signal, persistRota
       headers: { Cookie: "__client=" + cookie, Origin: APP, Accept: "application/json" },
     }, "Logicc sign-in");
     cookie = rotatedCookie(response, cookie);
+    if (requestSignal.aborted) {
+      await response.body?.cancel();
+      throw new LogiccError(504, "Logicc sign-in cancelled or timed out.");
+    }
     if (!response.ok) {
       await response.body?.cancel();
       throw httpError(response, "Logicc sign-in", { signIn: true });
@@ -151,10 +156,15 @@ export async function refreshAuth(auth, { fetchImpl = fetch, signal, persistRota
     const data = await send("/v1/client/sessions/" + encodeURIComponent(sid) + "/tokens", "POST");
     const jwt = data?.jwt;
     const payload = claims(jwt);
+    const previousSubject = claims(auth?.access).sub;
     if (typeof jwt !== "string" || payload.sid !== sid || !Number.isFinite(payload.exp) ||
         payload.exp * 1000 <= Date.now() + REFRESH_LEAD) {
       throw expired("Logicc returned an invalid or expired session token.");
     }
+    if (typeof previousSubject === "string" && previousSubject && payload.sub !== previousSubject) {
+      throw expired("Logicc returned a session token for a different account.");
+    }
+    if (requestSignal.aborted) throw new LogiccError(504, "Logicc sign-in cancelled or timed out.");
     return {
       access: jwt,
       refresh: cookie,
@@ -175,6 +185,9 @@ export async function refreshAuth(auth, { fetchImpl = fetch, signal, persistRota
 export function createAuthManager(client, fetchImpl) {
   const pending = new Map();
   const fallbackPending = new Map();
+  const refreshKey = auth => validSession(auth?.metadata?.sessionId)
+    ? createHash("sha256").update(JSON.stringify([auth.metadata.sessionId, auth.access, auth.refresh])).digest("hex")
+    : null;
   const save = async (auth) => {
     if (!client?.auth?.set) throw new LogiccError(500, "Magpie cannot persist the renewed sign-in.");
     try { await client.auth.set({ path: { id: ID }, body: auth }); }
@@ -182,8 +195,12 @@ export function createAuthManager(client, fetchImpl) {
   };
   const renew = (auth) => {
     if (auth?.type !== "oauth" || auth.metadata?.oauthGrant === "device") return Promise.reject(expired());
-    const key = validSession(auth.metadata?.sessionId) ? auth.metadata.sessionId : null;
+    const key = refreshKey(auth);
     if (!key) return Promise.reject(expired());
+    // The loader's fallback may still be saving the renewed account after the
+    // HTTP exchange finishes. The host refresh hook must join that operation,
+    // not start another refresh against the old sign-in.
+    if (fallbackPending.has(key)) return fallbackPending.get(key);
     if (pending.has(key)) return pending.get(key);
     const operation = refreshAuth(auth, { fetchImpl, persistRotation: save })
       .finally(() => pending.delete(key));
@@ -193,12 +210,21 @@ export function createAuthManager(client, fetchImpl) {
   const ensure = async (getAuth, { force = false, previous } = {}) => {
     const auth = await getAuth();
     if (auth?.type !== "oauth" || auth.metadata?.oauthGrant === "device") throw expired();
-    if (isFresh(auth) && (!force || (previous && auth.access !== previous))) return auth;
-    const key = validSession(auth.metadata?.sessionId) ? auth.metadata.sessionId : null;
+    const key = refreshKey(auth);
     if (!key) throw expired();
     if (fallbackPending.has(key)) return fallbackPending.get(key);
+    if (isFresh(auth) && (!force || (previous && auth.access !== previous))) return auth;
     const operation = renew(auth).then(async renewed => {
-      const updated = { ...auth, ...renewed, type: "oauth" };
+      const latest = await getAuth();
+      if (latest?.type !== "oauth" || latest.metadata?.sessionId !== auth.metadata.sessionId ||
+          latest.metadata?.oauthGrant === "device") throw expired();
+      if (latest.refresh !== auth.refresh || latest.access !== auth.access) {
+        // Do not overwrite a newer account snapshot or revive a signed-out
+        // account. Magpie's own host performs its atomic save independently.
+        if (isFresh(latest) && claims(latest.access).sub === claims(auth.access).sub) return latest;
+        throw new LogiccError(409, "Logicc sign-in changed during renewal. Retry the request.");
+      }
+      const updated = { ...latest, ...renewed, metadata: { ...renewed.metadata, ...latest.metadata }, type: "oauth" };
       await save(updated);
       return updated;
     }).finally(() => fallbackPending.delete(key));

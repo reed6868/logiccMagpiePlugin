@@ -165,6 +165,84 @@ test("API 401 triggers exactly one refresh and retry; 429 is not retried", async
   expect(calls).toBe(3);
 });
 
+test("host refresh joins a loader refresh that is still being persisted", async () => {
+  const initial = auth(jwt(sid, Math.floor(Date.now() / 1000) - 1));
+  let current = initial, refreshes = 0, writes = 0;
+  const started = Promise.withResolvers();
+  const release = Promise.withResolvers();
+  const manager = createAuthManager({ auth: { set: async ({ body }) => {
+    writes++;
+    started.resolve();
+    await release.promise;
+    current = body;
+  } } }, async () => {
+    refreshes++;
+    return json({ jwt: jwt() }, 200, { "Set-Cookie": "__client=fixture-rotated; Secure" });
+  });
+  const loader = manager.ensure(async () => current);
+  await started.promise;
+  const host = manager.renew(initial);
+  try {
+    await Bun.sleep(5);
+    expect(refreshes).toBe(1);
+    expect(writes).toBe(1);
+  } finally { release.resolve(); }
+  const [a, b] = await Promise.all([loader, host]);
+  expect(a).toEqual(b);
+  expect(current.refresh).toBe("fixture-rotated");
+});
+
+test("late loader renewal does not overwrite a newer sign-in or restore a logged-out account", async () => {
+  const initial = auth(jwt(sid, Math.floor(Date.now() / 1000) - 1));
+  for (const replacement of [null, auth(jwt(sid, Math.floor(Date.now() / 1000) + 300), "new-authorized-fixture")]) {
+    let current = initial, writes = 0;
+    const started = Promise.withResolvers(), release = Promise.withResolvers();
+    const manager = createAuthManager({ auth: { set: async () => { writes++; } } }, async () => {
+      started.resolve();
+      await release.promise;
+      return json({ jwt: jwt() });
+    });
+    const operation = manager.ensure(async () => current);
+    await started.promise;
+    current = replacement;
+    release.resolve();
+    if (replacement) expect(await operation).toEqual(replacement);
+    else await expect(operation).rejects.toMatchObject({ signIn: "expired" });
+    expect(writes).toBe(0);
+  }
+});
+
+test("refresh rejects a different JWT subject even if the session ID matches", async () => {
+  await expect(refreshAuth(auth(), { fetchImpl: async () =>
+    json({ jwt: jwt(sid, Math.floor(Date.now() / 1000) + 120, "user_other") }),
+  })).rejects.toMatchObject({ signIn: "expired" });
+});
+
+test("cancelled authentication does not start an upstream request", async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let calls = 0;
+  await expect(refreshAuth(auth(), { signal: controller.signal, fetchImpl: async () => {
+    calls++;
+    return json({ jwt: jwt() });
+  } })).rejects.toMatchObject({ status: 504 });
+  expect(calls).toBe(0);
+});
+
+test("cancellation after a rotation retains the new credential only for an existing account", async () => {
+  const controller = new AbortController();
+  let saved;
+  await expect(refreshAuth(auth(), {
+    signal: controller.signal,
+    fetchImpl: async () => {
+      controller.abort();
+      return json({ jwt: jwt() }, 200, { "Set-Cookie": "__client=fixture-rotated; Secure" });
+    },
+    persistRotation: async value => { saved = value; },
+  })).rejects.toMatchObject({ status: 504 });
+  expect(saved.refresh).toBe("fixture-rotated");
+});
+
 test("API forbidden model is not marked as expired sign-in", async () => {
   const manager = createAuthManager(undefined, async () => json({}, 403));
   try {
