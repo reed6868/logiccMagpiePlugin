@@ -12,7 +12,12 @@ function textOf(content) {
   return content.map(part => {
     if (["text", "input_text", "output_text"].includes(part?.type) && typeof part.text === "string") return part.text;
     if (["thinking", "redacted_thinking"].includes(part?.type)) return "";
-    invalid("Logicc currently supports text-only messages.");
+    const kind = typeof part?.type === "string" ? part.type.toLowerCase() : "";
+    if (["image", "image_url", "input_image", "output_image"].includes(kind)) return "[unsupported image omitted]";
+    if (["file", "input_file", "output_file", "document"].includes(kind)) return "[unsupported file omitted]";
+    if (["audio", "input_audio", "output_audio", "audio_url"].includes(kind)) return "[unsupported audio omitted]";
+    if (["video", "input_video", "video_url"].includes(kind)) return "[unsupported video omitted]";
+    return "[unsupported content omitted]";
   }).join("\n");
 }
 
@@ -30,8 +35,6 @@ export function normalize(body) {
   if (body.n !== undefined && body.n !== 1) invalid("Only n=1 is supported.");
   if (body.stream !== undefined && typeof body.stream !== "boolean") invalid("Invalid stream flag.");
   if (body.parallel_tool_calls !== undefined && typeof body.parallel_tool_calls !== "boolean") invalid("Invalid parallel_tool_calls.");
-  const max = body.max_completion_tokens ?? body.max_tokens;
-  if (max !== undefined && (!Number.isInteger(max) || max <= 0)) invalid("Invalid token limit.");
   const messages = [];
   const callIds = new Set(), results = new Set();
   for (const m of body.messages) {
@@ -55,16 +58,17 @@ export function normalize(body) {
   }
   if (!messages.some(m => m.content || m.tool_calls?.length)) invalid("Empty messages.");
   if (body.tools !== undefined && (!Array.isArray(body.tools) || body.tools.length > 128)) invalid("Invalid tools array.");
-  const tools = (body.tools ?? []).map(t => {
+  const tools = (body.tools ?? []).filter(t => t?.type === "function").map(t => {
     const fn = t?.function;
-    if (t?.type !== "function" || !obj(fn) || !TOOL_NAME.test(fn.name ?? "") ||
+    if (!obj(fn) || !TOOL_NAME.test(fn.name ?? "") ||
         (fn.parameters !== undefined && !obj(fn.parameters))) invalid("Only valid function tools are supported.");
     return { name: fn.name, description: typeof fn.description === "string" ? fn.description : "",
       parameters: fn.parameters ?? { type: "object", properties: {} } };
   });
   if (new Set(tools.map(t => t.name)).size !== tools.length) invalid("Duplicate tool names.");
   let choice = body.tool_choice ?? "auto";
-  if (obj(choice)) choice = choice.type === "function" ? choice.function?.name : undefined;
+  if (obj(choice)) choice = choice.type === "function" ? choice.function?.name : "auto";
+  if (!tools.length && choice === "required" && (body.tools ?? []).length) choice = "none";
   if (!["auto", "none", "required", ...tools.map(t => t.name)].includes(choice)) invalid("Invalid tool_choice.");
   const active = choice === "none" ? [] : tools.filter(t => ["auto", "required"].includes(choice) || t.name === choice);
   if (choice === "required" && !active.length) invalid("Required tool choice needs tools.");
@@ -72,7 +76,7 @@ export function normalize(body) {
   const model = body.model;
   return { model, messages, active, choice, required: choice === "required" || active.some(t => t.name === choice),
     parallel: body.parallel_tool_calls !== false, stream: body.stream === true, includeUsage: body.stream_options?.include_usage === true,
-    max, reasoning: body.reasoning_effort ?? body.reasoning?.effort };
+    reasoning: body.reasoning_effort ?? body.reasoning?.effort };
 }
 
 export function buildPrompt(request) {
@@ -81,17 +85,16 @@ export function buildPrompt(request) {
     if (m.role === "tool") return "[Tool result: " + m.tool_call_id + "]\n" + m.content;
     return m.role === "user" ? m.content : "[" + m.role + "]\n" + m.content;
   }).join("\n\n");
-  const limit = request.max ? "\nKeep the response within approximately " + request.max + " output tokens." : "";
-  if (!request.active.length) return history + limit;
+  if (!request.active.length) return history;
   return [
     "Serialize the next assistant turn for a client application. Only the client executes declared functions; do not execute them or invent their results.",
-    'Return exactly one JSON object without markdown: {"content": "text or null", "tool_calls": [{"name": "a declared tool", "arguments": {}}]}.',
+    'For tool calls only, begin your response with exactly one JSON object without markdown: {"tool_calls": [{"name": "a declared tool", "arguments": {}}]}. Do not put prose before or after the object.',
     "Arguments must match the tool schema. If a tool is needed, request it and stop. Use previous tool results when available.",
-    request.required ? "You MUST request " + (request.choice === "required" ? "at least one declared tool." : request.choice + ".") : "Choose a tool only when needed; otherwise answer in content with an empty tool_calls array.",
+    request.required ? "You MUST request " + (request.choice === "required" ? "at least one declared tool." : request.choice + ".") : "Choose a tool only when needed; otherwise respond directly in ordinary text, with no JSON wrapper or tool-call marker.",
     "Parallel calls: " + (request.parallel ? "allowed" : "disabled; at most one call."),
     "Declared client tools:\n" + JSON.stringify(request.active),
     "Conversation:\n" + JSON.stringify(request.messages),
-    "Return the next assistant turn JSON now." + limit,
+    "Return the next assistant turn now.",
   ].join("\n");
 }
 
@@ -129,7 +132,7 @@ export function validateCalls(calls, request) {
   });
 }
 
-export function parseToolOutput(text, request, nativeCalls = []) {
+export function parseToolOutput(text, request, nativeCalls = [], { requireEnvelope = false } = {}) {
   if (nativeCalls.length) return { text, calls: validateCalls(nativeCalls, request) };
   let value = text.trim();
   const fence = /^\x60\x60\x60(?:json)?\s*\n?([\s\S]*?)\n?\x60\x60\x60\s*$/i.exec(value);
@@ -143,6 +146,6 @@ export function parseToolOutput(text, request, nativeCalls = []) {
     if (request.required && !calls.length) badTool("Model did not request the required tool.");
     return { text: parsed.content ?? "", calls };
   }
-  if (request.required) badTool("Model did not return a valid required tool call.");
+  if (request.required || requireEnvelope) badTool("Model did not return a valid tool-call envelope.");
   return { text, calls: [] };
 }

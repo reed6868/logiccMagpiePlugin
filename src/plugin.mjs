@@ -1,20 +1,44 @@
-import { API, ID, REFRESH_LEAD, LogiccError, createAuthManager, refreshAuth, apiRequest, validCookie, validSession,
-  validClientId, beginDeviceAuthorization, completeDeviceAuthorization } from "./auth.mjs";
-import { DEFAULT_MODEL, SDK, listModels, runtimeModels } from "./models.mjs";
+import { API, ID, REFRESH_LEAD, LogiccError, createAuthManager, refreshAuth, apiRequest, parseClientCredential, validSession } from "./auth.mjs";
+import { DEFAULT_MODEL, SDK, listModels, runtimeModels, createModelCatalog } from "./models.mjs";
 import { normalize, buildPrompt } from "./prompt.mjs";
 import { openAIResponse, errorResponse } from "./stream.mjs";
 
 const failed = error => ({ type: "failed", error: error instanceof LogiccError ? error.message :
-  "Logicc sign-in failed. Check the browser or sign in again." });
+  "Logicc sign-in failed. Check your authorized credentials and try again." });
+const INPUT_BUDGET = 32 * 1024 * 1024;
+const PROMPT_BUDGET = 16 * 1024 * 1024;
+const GENERATION_TIMEOUT = 900_000;
 
-export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait } = {}) {
+async function readBounded(request) {
+  if (!request.body) return "";
+  const length = Number(request.headers.get("content-length"));
+  if (length > INPUT_BUDGET) throw new LogiccError(413, "Request exceeds the 32 MiB input budget.");
+  const reader = request.body.getReader(), decoder = new TextDecoder();
+  let size = 0, text = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return text + decoder.decode();
+      size += value.byteLength;
+      if (size > INPUT_BUDGET) {
+        await reader.cancel();
+        throw new LogiccError(413, "Request exceeds the 32 MiB input budget.");
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally { reader.releaseLock(); }
+}
+
+export function createPlugin({ client, fetchImpl = globalThis.fetch } = {}) {
   const manager = createAuthManager(client, fetchImpl);
+  const catalog = createModelCatalog(manager, fetchImpl);
   async function signIn(cookie, sid, signal) {
     try {
+      if (signal?.aborted) throw new LogiccError(400, "Logicc sign-in cancelled.");
       let auth = await refreshAuth({ refresh: cookie, metadata: { ...(sid ? { sessionId: sid } : {}) } },
         { fetchImpl, signal });
-      // Confirm that the account actually has access to Logicc models.
-      // Do not write to a host account until the login callback succeeds.
+      // Verify catalogue access before handing the account to the host.
+      // Actual inference is covered separately by the live E2E.
       const getAuth = async () => ({ ...auth, type: "oauth" });
       const loginManager = {
         async ensure(_getAuth, { force = false } = {}) {
@@ -22,7 +46,10 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait 
           return getAuth();
         },
       };
-      await listModels(loginManager, getAuth, fetchImpl, signal);
+      const models = await listModels(loginManager, getAuth, fetchImpl, signal);
+      if (signal?.aborted) throw new LogiccError(400, "Logicc sign-in cancelled.");
+      const { defaultId } = catalog.remember(auth, models);
+      auth = { ...auth, metadata: { ...auth.metadata, defaultModelId: defaultId } };
       return { type: "success", ...auth };
     } catch (error) { return failed(error); }
   }
@@ -36,61 +63,23 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait 
       methods: [
         {
           type: "oauth",
-          label: "Logicc OAuth (system browser, approved client ID required)",
-          prompts: [{
-            type: "text", key: "clientId", message: "Public OAuth client ID issued by Logicc (not an API key)",
-            validate: value => validClientId(value?.trim()) ? undefined : "An approved public OAuth client ID is required.",
-          }],
-          async authorize(inputs, { signal } = {}) {
-            let device;
-            try { device = await beginDeviceAuthorization(inputs?.clientId?.trim(), { fetchImpl, signal }); }
-            catch (error) { return failed(error); }
-            return {
-              url: device.url,
-              method: "auto",
-              instructions: "Sign in and consent in your normal browser. Enter the device code " + device.userCode + ". Magpie will finish after Logicc authorizes the client.",
-              async callback(_code, { signal: callbackSignal } = {}) {
-                const signals = [signal, callbackSignal].filter(Boolean);
-                const combined = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
-                try {
-                  const auth = await completeDeviceAuthorization(device, { fetchImpl, signal: combined, wait: deviceWait });
-                  const getAuth = async () => ({ ...auth, type: "oauth" });
-                  // A Clerk OAuth grant is not proof that Logicc's inference
-                  // endpoint accepts the token. Verify before saving any account.
-                  const verifyManager = { async ensure(_getAuth, { force = false } = {}) {
-                    if (force) throw new LogiccError(401, "Logicc does not accept this OAuth token for model access.");
-                    return getAuth();
-                  } };
-                  try { await listModels(verifyManager, getAuth, fetchImpl, combined); }
-                  catch (error) {
-                    if (error.status === 401 || error.status === 403) {
-                      throw new LogiccError(error.status, "Logicc OAuth consent succeeded, but model access was refused. The client must be authorized for inference.");
-                    }
-                    throw error;
-                  }
-                  if (combined?.aborted) throw new LogiccError(400, "Logicc OAuth sign-in cancelled.");
-                  return { type: "success", ...auth };
-                } catch (error) { return failed(error); }
-              },
-            };
-          },
-        },
-        {
-          type: "oauth",
-          label: "Logicc manual sign-in (client credential + optional session ID)",
+          label: "Logicc authorized credential import (optional session ID)",
           prompts: [
             { type: "password", key: "cookie", message: "Existing authorized Logicc client credential (sensitive)",
-              validate: v => validCookie(v?.trim()) ? undefined : "Enter a valid client credential." },
+              validate: v => parseClientCredential(v) ? undefined : "Enter a valid authorized client credential." },
             { type: "text", key: "sid", message: "Session ID (sess_..., or leave empty for discovery)",
               validate: v => !v?.trim() || validSession(v.trim()) ? undefined : "Invalid sess_ ID." },
           ],
           async authorize(inputs = {}, { signal } = {}) {
-            const cookie = inputs.cookie?.trim();
+            const cookie = parseClientCredential(inputs.cookie);
             const sid = inputs.sid?.trim();
-            if (!validCookie(cookie) || (sid && !validSession(sid))) return { type: "failed", error: "Invalid Logicc sign-in input." };
+            if (!cookie || (sid && !validSession(sid))) return { type: "failed", error: "Invalid Logicc sign-in input." };
             return {
               url: "", method: "auto", instructions: "Verifying your Logicc sign-in.",
-              callback: (_code, { signal: callbackSignal } = {}) => signIn(cookie, sid, callbackSignal ?? signal),
+              callback: (_code, { signal: callbackSignal } = {}) => {
+                const signals = [signal, callbackSignal].filter(Boolean);
+                return signIn(cookie, sid, signals.length > 1 ? AbortSignal.any(signals) : signals[0]);
+              },
             };
           },
         },
@@ -109,20 +98,24 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait 
                   url.pathname !== "/api/chat/completions") {
                 throw new LogiccError(400, "Only Logicc chat/completions is supported.");
               }
-              const raw = await request.text();
-              if (Buffer.byteLength(raw) > 2 * 1024 * 1024) throw new LogiccError(413, "Request is too large.");
+              const raw = await readBounded(request);
               let body;
               try { body = JSON.parse(raw); } catch { throw new LogiccError(400, "Invalid JSON request."); }
               const req = normalize(body);
               const cancellation = new AbortController();
-              const signal = AbortSignal.any([request.signal, cancellation.signal, AbortSignal.timeout(180_000)]);
+              const signal = AbortSignal.any([request.signal, cancellation.signal, AbortSignal.timeout(GENERATION_TIMEOUT)]);
               if (req.model === "default") {
-                const models = await listModels(manager, getAuth, fetchImpl, signal);
-                req.model = (models.find(m => m.isDefault) ?? models[0]).id;
+                const { models, defaultId } = await catalog.get(getAuth, signal);
+                if (!models.some(m => m.id === defaultId)) {
+                  throw new LogiccError(409, "The pinned default model is no longer available. Select an explicit Logicc model.");
+                }
+                req.model = defaultId;
               }
               const prompt = buildPrompt(req);
-              if (Buffer.byteLength(prompt) > 2 * 1024 * 1024) throw new LogiccError(413, "Prompt is too large.");
-              const create = await apiRequest(manager, getAuth, fetchImpl, "chats", { body: {}, signal });
+              if (Buffer.byteLength(prompt) > PROMPT_BUDGET) throw new LogiccError(413, "Prompt exceeds the 16 MiB text budget.");
+              const create = await apiRequest(manager, getAuth, fetchImpl, "chats", {
+                body: {}, signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+              });
               let created;
               try { created = await create.json(); } catch { throw new LogiccError(502, "Logicc chat creation returned invalid JSON."); }
               const chatId = typeof created === "string" ? created : created?.id;
@@ -144,9 +137,11 @@ export function createPlugin({ client, fetchImpl = globalThis.fetch, deviceWait 
       id: ID,
       async models(provider, { auth } = {}) {
         if (auth?.type !== "oauth") return provider.models;
-        try { return runtimeModels(await listModels(manager, async () => auth, fetchImpl), provider); }
-        catch (error) {
-          if (error?.signIn === "expired") throw error;
+        try {
+          const snapshot = await catalog.get(async () => auth);
+          return runtimeModels(snapshot.models, provider, snapshot.defaultId);
+        } catch (error) {
+          if (error?.signIn === "expired" || error.status === 401 || error.status === 403) throw error;
           return provider.models;
         }
       },
