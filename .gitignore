@@ -7,3 +7,11 @@ coverage/
 .cache/
 plugin-auth.json
 browser-profile*/
+*.har
+*.pcap
+*.pem
+*.key
+cookies*.txt
+tokens*.txt
+auth*.json
+state.json
